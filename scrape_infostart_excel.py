@@ -11,11 +11,12 @@ from bs4 import BeautifulSoup
 
 BASE = "https://infostart.ru"
 #LIST_PATH = "/public/all/integraciya_i_obmen_dannymi/zagruzka_i_vygruzka_v_excel/"
-LIST_PATH = "/public/all/priemy_i_metody_razrabotki/"
+#LIST_PATH = "/public/all/priemy_i_metody_razrabotki/"
+LIST_PATH = "/public/all/integraciya_i_obmen_dannymi"
 SORT = "property_count_download"
 OUT_DIR = Path(r"D:\prog\infostart")
-CSV_PATH = OUT_DIR / "infostart_metody_razrabotki.csv"
-XLSX_PATH = OUT_DIR / "infostart_metody_razrabotki.xlsx"
+CSV_PATH = OUT_DIR / "integraciya_i_obmen_dannymi.csv"
+XLSX_PATH = OUT_DIR / "integraciya_i_obmen_dannymi.xlsx"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0 Safari/537.36",
