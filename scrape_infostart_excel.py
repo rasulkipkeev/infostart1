@@ -1,5 +1,7 @@
 import csv
 import html
+import logging
+import random
 import re
 import time
 import zipfile
@@ -8,15 +10,28 @@ from xml.sax.saxutils import escape
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
 BASE = "https://infostart.ru"
-#LIST_PATH = "/public/all/integraciya_i_obmen_dannymi/zagruzka_i_vygruzka_v_excel/"
-#LIST_PATH = "/public/all/priemy_i_metody_razrabotki/"
 LIST_PATH = "/public/all/integraciya_i_obmen_dannymi"
 SORT = "property_count_download"
 OUT_DIR = Path(r"D:\prog\infostart")
-CSV_PATH = OUT_DIR / "integraciya_i_obmen_dannymi.csv"
-XLSX_PATH = OUT_DIR / "integraciya_i_obmen_dannymi.xlsx"
+
+# Динамические имена файлов на основе LIST_PATH
+base_name = LIST_PATH.strip('/').split('/')[-1]
+if not base_name:
+    base_name = "infostart_data"
+CSV_PATH = OUT_DIR / f"{base_name}.csv"
+XLSX_PATH = OUT_DIR / f"{base_name}.xlsx"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0 Safari/537.36",
@@ -45,11 +60,25 @@ def page_url(page: int) -> str:
     return f"{BASE}{LIST_PATH}?sort={SORT}&PAGEN_1={page}"
 
 
-session = requests.Session()
-session.headers.update(HEADERS)
+def get_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
+    # Настройка повторных попыток (Retries)
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    
+    return session
 
 
-def get_soup(url: str) -> BeautifulSoup:
+def get_soup(session: requests.Session, url: str) -> BeautifulSoup:
     resp = session.get(url, timeout=60)
     resp.raise_for_status()
     resp.encoding = "cp1251"
@@ -64,7 +93,8 @@ def extract_total_pages(soup: BeautifulSoup) -> int:
         if m:
             pages.append(int(m.group(1)))
     if not pages:
-        raise RuntimeError("Pagination not found")
+        logger.warning("Pagination not found, assuming 1 page.")
+        return 1
     return max(pages)
 
 
@@ -99,12 +129,18 @@ def extract_item(item: BeautifulSoup, page: int, pos: int) -> dict:
         if txt:
             tags.append(txt)
 
-    meta = [normalize_text(span.get_text(" ", strip=True)) for span in item.select("p.desc-article span.text-nowrap")]
-    date = meta[0] if len(meta) > 0 else ""
-    views = meta[1] if len(meta) > 1 else ""
-    downloads = meta[2] if len(meta) > 2 else ""
-    author = meta[3] if len(meta) > 3 else ""
-    comments = meta[4] if len(meta) > 4 else ""
+    # Более безопасное извлечение мета-данных (на случай изменения их количества)
+    meta_spans = item.select("p.desc-article span.text-nowrap")
+    meta = [normalize_text(span.get_text(" ", strip=True)) for span in meta_spans]
+    
+    def safe_get(lst: list, idx: int) -> str:
+        return lst[idx] if idx < len(lst) else ""
+
+    date = safe_get(meta, 0)
+    views = safe_get(meta, 1)
+    downloads = safe_get(meta, 2)
+    author = safe_get(meta, 3)
+    comments = safe_get(meta, 4)
 
     if not downloads or not comments or not views:
         stats = [normalize_text(span.get_text(" ", strip=True)) for span in item.select("div.view-table-right span.text-nowrap")]
@@ -132,11 +168,14 @@ def extract_item(item: BeautifulSoup, page: int, pos: int) -> dict:
     }
 
 
-def write_csv(rows: list[dict]) -> None:
-    with CSV_PATH.open("w", encoding="utf-8-sig", newline="") as f:
+def append_to_csv(row: dict) -> None:
+    # Запись одной строки (дозапись)
+    file_exists = CSV_PATH.exists()
+    with CSV_PATH.open("a", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def col_letter(idx: int) -> str:
@@ -153,6 +192,8 @@ def xlsx_cell(value: str) -> str:
 
 
 def write_xlsx(rows: list[dict]) -> None:
+    if not rows:
+        return
     widths = []
     for field in FIELDS:
         max_len = max([len(field)] + [len(str(row.get(field, ""))) for row in rows])
@@ -228,31 +269,51 @@ def write_xlsx(rows: list[dict]) -> None:
 
 
 def main() -> None:
-    first = get_soup(page_url(1))
-    total_pages = extract_total_pages(first)
-    rows = []
-    seen_urls = set()
+    # Удаляем старый CSV, если он существует, чтобы дозапись начиналась с чистого листа
+    if CSV_PATH.exists():
+        CSV_PATH.unlink()
+        logger.info(f"Удален старый файл: {CSV_PATH}")
 
-    for page in range(1, total_pages + 1):
-        soup = first if page == 1 else get_soup(page_url(page))
-        items = soup.select("div.publication-item")
-        if not items:
-            raise RuntimeError(f"No publication items on page {page}")
-        for pos, item in enumerate(items, start=1):
-            row = extract_item(item, page, pos)
-            if row["card_url"] in seen_urls:
-                continue
-            seen_urls.add(row["card_url"])
-            rows.append(row)
-        print(f"page {page}/{total_pages}: {len(items)} items, total unique {len(rows)}")
-        time.sleep(0.3)
+    with get_session() as session:
+        logger.info(f"Запрос первой страницы: {page_url(1)}")
+        first = get_soup(session, page_url(1))
+        total_pages = extract_total_pages(first)
+        logger.info(f"Найдено страниц: {total_pages}")
+        
+        rows = []
+        seen_urls = set()
 
-    write_csv(rows)
-    write_xlsx(rows)
-    print(f"saved csv: {CSV_PATH}")
-    print(f"saved xlsx: {XLSX_PATH}")
-    print(f"rows: {len(rows)}")
-    print(f"pages: {total_pages}")
+        for page in range(1, total_pages + 1):
+            try:
+                soup = first if page == 1 else get_soup(session, page_url(page))
+                items = soup.select("div.publication-item")
+                if not items:
+                    logger.warning(f"Пустая страница (нет публикаций): {page}")
+                    continue
+
+                page_rows = 0
+                for pos, item in enumerate(items, start=1):
+                    row = extract_item(item, page, pos)
+                    if row["card_url"] in seen_urls:
+                        continue
+                    seen_urls.add(row["card_url"])
+                    rows.append(row)
+                    append_to_csv(row)
+                    page_rows += 1
+                
+                logger.info(f"Страница {page}/{total_pages} обработана: {page_rows} новых элементов. Всего: {len(rows)}")
+                
+                # Рандомизированная задержка
+                time.sleep(random.uniform(0.3, 1.0))
+            except Exception as e:
+                logger.error(f"Ошибка при обработке страницы {page}: {e}")
+
+        if rows:
+            logger.info(f"Генерация Excel файла: {XLSX_PATH}")
+            write_xlsx(rows)
+            logger.info(f"Успешно сохранено XLSX строк: {len(rows)}")
+        else:
+            logger.warning("Не собрано ни одной строки данных.")
 
 
 if __name__ == "__main__":
